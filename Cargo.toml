@@ -1,0 +1,23 @@
+[package]
+name = "commons_statements"
+version = "0.1.0"
+authors = ["Magnus Manske <magnusmanske@googlemail.com>"]
+edition = "2018"
+
+[dependencies]
+
+#mediawiki = "0.1.10"
+mediawiki = { path = "../mediawiki" }
+
+#wikibase = "0.1"
+wikibase = { path = "../wikibase_rs" }
+#wikibase = { git="https://gitlab.com/tobias47n9e/wikibase_rs"}
+
+#reqwest = "0.9.11"
+serde_json = "1.0.39"
+#libflate = "0.1.21"
+config = "0.9.2"
+#chrono = "0.4.6"
+lazy_static = "1"
+regex = "1"
+#percent-encoding = "1"
