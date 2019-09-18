@@ -6,12 +6,12 @@ edition = "2018"
 
 [dependencies]
 
-mediawiki = "0.1.12"
+#mediawiki = "0.1.12"
 #mediawiki = { path = "../mediawiki" }
 
-wikibase = "0.3.7"
+#wikibase = "0.3.7"
 #wikibase = { path = "../wikibase_rs" }
-#wikibase = { git="https://gitlab.com/tobias47n9e/wikibase_rs"}
+wikibase = { git="https://gitlab.com/tobias47n9e/wikibase_rs",branch="rayon"}
 
 #reqwest = "0.9.11"
 serde_json = "1.0.39"
