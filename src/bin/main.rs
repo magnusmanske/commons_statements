@@ -1,12 +1,18 @@
 #[macro_use]
 extern crate serde_json;
+extern crate reqwest;
 extern crate wikibase;
 
-use config::{Config, File};
+//use config::{Config, File};
 use percent_encoding::percent_decode;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::time::Duration;
 use wikibase::entity_container::*;
 use wikibase::mediawiki::api::{Api, NamespaceID};
 use wikibase::mediawiki::title::Title;
@@ -16,17 +22,69 @@ use wikibase::*;
 pub struct MW {
     pub api: Api,
     pub ec: EntityContainer,
+    pub bot_log_file: String,
+    pub verbose: bool,
 }
 
 impl MW {
     pub fn new(api_url: &str) -> Self {
         let mut ret = Self {
-            api: Api::new(api_url).expect("MediaWikiAPI new failed"),
+            api: Api::new_from_builder(api_url, Self::get_builder())
+                .expect("MediaWikiAPI new failed"),
             ec: EntityContainer::new(),
+            bot_log_file: "bot.log".to_string(),
+            verbose: false,
         };
         ret.api.set_edit_delay(Some(500)); // 500 ms delay after each edit
         ret.ec.allow_special_entity_data(false);
         ret
+    }
+
+    fn get_builder() -> reqwest::ClientBuilder {
+        reqwest::ClientBuilder::new().timeout(Duration::from_secs(240))
+    }
+
+    pub fn new_from_ini_file(filename: &str, api_url: &str) -> Self {
+        let mut settings = config::Config::default();
+        settings.merge(config::File::with_name(filename)).unwrap();
+        let lgname = settings.get_str("user.user").unwrap();
+        let lgpass = settings.get_str("user.pass").unwrap();
+
+        let mut ret = Self::new(api_url);
+        ret.api.set_edit_delay(Some(500)); // Half a second between edits
+        ret.api.login(lgname, lgpass).unwrap();
+        ret
+    }
+
+    pub fn in_bot_log(&self, parts: Vec<&String>) -> bool {
+        let f = match File::open(self.bot_log_file.to_owned()) {
+            Ok(f) => f,
+            _ => return false,
+        };
+        let parts: Vec<String> = parts.iter().map(|s| format!("\"{}\"", s)).collect(); // Quote parts
+        let f = BufReader::new(f);
+        let ret = f
+            .lines()
+            .filter_map(|l| l.ok())
+            .any(|l| parts.iter().all(|p| l.contains(p)));
+        if self.verbose && ret {
+            println!("Found a row for {:?}", &parts);
+        }
+        ret
+    }
+
+    pub fn append_log(&self, line: String) {
+        if self.verbose {
+            println!("{:?}", &line);
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(self.bot_log_file.to_owned())
+            .unwrap();
+        match writeln!(file, "{}", line) {
+            _ => {} // Meh
+        }
     }
 
     pub fn api_query_prop2(
@@ -268,7 +326,8 @@ struct CategoryItemImage {
     pub image: Option<String>,
 }
 
-fn _depicts_german_buildings(commons: &mut MW) {
+fn _depicts_german_buildings() {
+    let mut commons = MW::new_from_ini_file("bot.ini", "https://commons.wikimedia.org/w/api.php");
     let url = "https://petscan.wmflabs.org/?psid=11247873&format=json"; // TODO FIXME
     let petscan_result = commons
         .api
@@ -356,6 +415,11 @@ fn _depicts_german_buildings(commons: &mut MW) {
     });
     cii.retain(|c| c.item.is_some() && c.image.is_some());
 
+    // Remove ones we had already
+    cii.retain(|c| {
+        !commons.in_bot_log(vec![&c.item.as_ref().unwrap(), &c.image.as_ref().unwrap()])
+    });
+
     // Paranoia
     cii.retain(|c| match commons.ec.get_entity(c.item.as_ref().unwrap()) {
         Some(entity) => !entity.has_target_entity("P31", "Q4167836"),
@@ -363,18 +427,17 @@ fn _depicts_german_buildings(commons: &mut MW) {
     });
 
     // Add "depicts" to files
-    cii.iter().for_each(|c| {
-        println!("{:?}", &c);
-        match (c.item.as_ref(), c.image.as_ref()) {
+    cii.iter()
+        .for_each(|c| match (c.item.as_ref(), c.image.as_ref()) {
             (Some(item), Some(image)) => {
+                commons.append_log(format!("Adding \"P180\": \"{}\" to \"{}\"", &item, &image));
                 match commons.add_target_prominent(&item, &image, &"P180".to_string()) {
                     Ok(_) => {}
                     Err(e) => eprintln!("{:?} : {:?}", c, e),
                 }
             }
             _ => {}
-        }
-    });
+        });
 }
 
 //________________________________________________________________________________________________________________
@@ -387,11 +450,16 @@ struct ItemArticleImagesPageImage {
     pub pageimage: Option<String>,
 }
 
-fn depicts_p18_and_free_page_image(commons: &mut MW, sparql_part: &str, server: &str) {
-    let local_wiki_api = Api::new(format!("https://{}/w/api.php", &server).as_str()).unwrap();
+fn depicts_p18_and_free_page_image(sparql_part: &str, server: &str) {
+    let mut commons = MW::new_from_ini_file("bot.ini", "https://commons.wikimedia.org/w/api.php");
+    let local_wiki_api = Api::new_from_builder(
+        format!("https://{}/w/api.php", &server).as_str(),
+        MW::get_builder(),
+    )
+    .unwrap();
     let sparql = format!("SELECT ?q ?image ?article {{ {} . ?q  wdt:P18 ?image . ?article schema:about ?q ; schema:isPartOf <https://{}/> }}",&sparql_part,&server);
-    println!("{}", &sparql); // TESTING FIXME
-    let wikidata = Api::new("https://www.wikidata.org/w/api.php").unwrap();
+    let wikidata =
+        Api::new_from_builder("https://www.wikidata.org/w/api.php", MW::get_builder()).unwrap();
     let json = wikidata.sparql_query(&sparql).expect("SPARQL query failed");
 
     let iaipi: Vec<ItemArticleImagesPageImage> = match json["results"]["bindings"].as_array() {
@@ -415,6 +483,7 @@ fn depicts_p18_and_free_page_image(commons: &mut MW, sparql_part: &str, server: 
             pageimage: None,
         })
     })
+    .filter(|i| !commons.in_bot_log(vec![&i.q, &i.p18.as_ref().unwrap()]))
     .collect();
 
     iaipi.iter().for_each(
@@ -422,7 +491,7 @@ fn depicts_p18_and_free_page_image(commons: &mut MW, sparql_part: &str, server: 
             Some(pageimage) => {
                 if x.p18 == Some(pageimage.to_owned()) {
                     if !commons.is_artwork(&format!("File:{}", &pageimage)) {
-                        println!("{:?} : {}", &x, &pageimage);
+                        commons.append_log(format!("{:?} : \"{}\"", &x, &pageimage));
                         match commons.add_target_prominent(
                             &x.q,
                             &x.p18.as_ref().unwrap(),
@@ -440,22 +509,8 @@ fn depicts_p18_and_free_page_image(commons: &mut MW, sparql_part: &str, server: 
 }
 
 fn main() {
-    let mut settings = Config::default();
-    settings.merge(File::with_name("bot.ini")).unwrap();
-    let lgname = settings.get_str("user.user").unwrap();
-    let lgpass = settings.get_str("user.pass").unwrap();
-
-    let mut commons = MW::new("https://commons.wikimedia.org/w/api.php");
-    commons.api.set_edit_delay(Some(500)); // Half a second between edits
-    commons.api.login(lgname, lgpass).unwrap();
-
-    //depicts_german_buildings(&mut commons);
-
-    depicts_p18_and_free_page_image(
-        &mut commons,
-        "?q wdt:P31 wd:Q5 ; wdt:P21 wd:Q6581072",
-        "de.wikipedia.org",
-    );
+    //depicts_german_buildings();
+    depicts_p18_and_free_page_image("?q wdt:P31 wd:Q5 ; wdt:P21 wd:Q6581072", "de.wikipedia.org");
 }
 
 #[cfg(test)]
