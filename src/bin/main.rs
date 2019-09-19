@@ -3,6 +3,7 @@ extern crate serde_json;
 extern crate wikibase;
 
 use config::{Config, File};
+use percent_encoding::percent_decode;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
@@ -155,6 +156,52 @@ impl MW {
         }
     }
 
+    pub fn get_free_page_image(&self, mw_api: &Api, page: &String) -> Option<String> {
+        mw_api
+            .get_query_api_json(&mw_api.params_into(&vec![
+                ("action", "query"),
+                ("prop", "pageprops"),
+                ("titles", page.as_str()),
+            ]))
+            .ok()?["query"]["pages"]
+            .as_object()?
+            .iter()
+            .filter_map(|(_pageid, pagedata)| pagedata["pageprops"]["page_image_free"].as_str())
+            .map(|s| s.to_string())
+            .nth(0)
+    }
+
+    pub fn page_contains_template(&self, page: &String, template: &str) -> bool {
+        match self.api.get_query_api_json(&self.api.params_into(&vec![
+            ("action", "query"),
+            ("prop", "templates"),
+            ("tltemplates", format!("Template:{}", template).as_str()),
+            ("titles", page.as_str()),
+        ])) {
+            Ok(j) => match j["query"]["pages"].as_object() {
+                Some(pages) => pages
+                    .iter()
+                    .any(|(_pageid, pagedata)| pagedata["templates"].is_array()),
+                None => false,
+            },
+
+            _ => false,
+        }
+    }
+
+    // file with File: prefix!
+    pub fn is_artwork(&self, file: &String) -> bool {
+        self.page_contains_template(file, "Artwork")
+    }
+
+    pub fn percent_decode_title(s: String) -> String {
+        percent_decode(s.as_bytes())
+            .decode_utf8()
+            .expect(format!("fix_attribute_value: '{}' is not utf8", s).as_str())
+            .replace(' ', "_")
+            .to_string()
+    }
+
     pub fn add_target_prominent(
         &mut self,
         source_item: &String,
@@ -221,16 +268,7 @@ struct CategoryItemImage {
     pub image: Option<String>,
 }
 
-fn main() {
-    let mut settings = Config::default();
-    settings.merge(File::with_name("bot.ini")).unwrap();
-    let lgname = settings.get_str("user.user").unwrap();
-    let lgpass = settings.get_str("user.pass").unwrap();
-
-    let mut commons = MW::new("https://commons.wikimedia.org/w/api.php");
-    commons.api.set_edit_delay(Some(500)); // Half a second between edits
-    commons.api.login(lgname, lgpass).unwrap();
-
+fn _depicts_german_buildings(commons: &mut MW) {
     let url = "https://petscan.wmflabs.org/?psid=11247873&format=json"; // TODO FIXME
     let petscan_result = commons
         .api
@@ -253,6 +291,7 @@ fn main() {
             }),
             _ => None,
         })
+        .filter(|c| !commons.is_artwork(&c.image.as_ref().unwrap()))
         .collect();
 
     // Load entities
@@ -336,14 +375,101 @@ fn main() {
             _ => {}
         }
     });
+}
 
-    //println!("{:#?}", &cii);
+//________________________________________________________________________________________________________________
 
-    /*
-        let source_item = "Q62378".to_string();
-        let filename = "Tower of London viewed from the River Thames.jpg".to_string();
-        let property = "P180".to_string();
+#[derive(Debug, Clone)]
+struct ItemArticleImagesPageImage {
+    pub q: String,
+    pub article: String,
+    pub p18: Option<String>,
+    pub pageimage: Option<String>,
+}
 
-        println!("{}", &result);
-    */
+fn depicts_p18_and_free_page_image(commons: &mut MW, sparql_part: &str, server: &str) {
+    let local_wiki_api = Api::new(format!("https://{}/w/api.php", &server).as_str()).unwrap();
+    let sparql = format!("SELECT ?q ?image ?article {{ {} . ?q  wdt:P18 ?image . ?article schema:about ?q ; schema:isPartOf <https://{}/> }}",&sparql_part,&server);
+    println!("{}", &sparql); // TESTING FIXME
+    let wikidata = Api::new("https://www.wikidata.org/w/api.php").unwrap();
+    let json = wikidata.sparql_query(&sparql).expect("SPARQL query failed");
+
+    let iaipi: Vec<ItemArticleImagesPageImage> = match json["results"]["bindings"].as_array() {
+        Some(b) => b,
+        None => panic!("No bindings in SPARQL results"),
+    }
+    .iter()
+    .filter_map(|b| {
+        let (q, p18, article) = match (
+            b["q"]["value"].as_str(),
+            b["image"]["value"].as_str(),
+            b["article"]["value"].as_str(),
+        ) {
+            (Some(q), Some(i), Some(a)) => (q, i, a),
+            _ => return None,
+        };
+        Some(ItemArticleImagesPageImage {
+            q: wikidata.extract_entity_from_uri(q).ok()?,
+            p18: Some(MW::percent_decode_title(p18.split('/').last()?.to_string())),
+            article: MW::percent_decode_title(article.split('/').last()?.to_string()),
+            pageimage: None,
+        })
+    })
+    .collect();
+
+    iaipi.iter().for_each(
+        |x| match commons.get_free_page_image(&local_wiki_api, &x.article) {
+            Some(pageimage) => {
+                if x.p18 == Some(pageimage.to_owned()) {
+                    if !commons.is_artwork(&format!("File:{}", &pageimage)) {
+                        println!("{:?} : {}", &x, &pageimage);
+                        match commons.add_target_prominent(
+                            &x.q,
+                            &x.p18.as_ref().unwrap(),
+                            &"P180".to_string(),
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("{:?} : {:?}", x, e),
+                        }
+                    }
+                }
+            }
+            None => {}
+        },
+    );
+}
+
+fn main() {
+    let mut settings = Config::default();
+    settings.merge(File::with_name("bot.ini")).unwrap();
+    let lgname = settings.get_str("user.user").unwrap();
+    let lgpass = settings.get_str("user.pass").unwrap();
+
+    let mut commons = MW::new("https://commons.wikimedia.org/w/api.php");
+    commons.api.set_edit_delay(Some(500)); // Half a second between edits
+    commons.api.login(lgname, lgpass).unwrap();
+
+    //depicts_german_buildings(&mut commons);
+
+    depicts_p18_and_free_page_image(
+        &mut commons,
+        "?q wdt:P31 wd:Q5 ; wdt:P21 wd:Q6581072",
+        "de.wikipedia.org",
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_artwork() {
+        let commons = MW::new("https://commons.wikimedia.org/w/api.php");
+        assert!(commons.is_artwork(
+            &"File:Lady_Elizabeth_Hamilton_(1753–1797),_Countess_of_Derby.jpg".to_string()
+        ));
+        assert!(!commons.is_artwork(
+            &"File:09797jfBarangays_West_Triangle_Quezon_City_Avenue_Bridgefvf_02.jpg".to_string()
+        ));
+    }
 }
