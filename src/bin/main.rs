@@ -1,9 +1,11 @@
 #[macro_use]
 extern crate serde_json;
+extern crate mediawiki_parser;
 extern crate reqwest;
 extern crate wikibase;
 
 //use config::{Config, File};
+use mediawiki_parser::Element;
 use percent_encoding::percent_decode;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -63,14 +65,16 @@ impl MW {
         };
         let parts: Vec<String> = parts.iter().map(|s| format!("\"{}\"", s)).collect(); // Quote parts
         let f = BufReader::new(f);
-        let ret = f
-            .lines()
+        f.lines()
             .filter_map(|l| l.ok())
-            .any(|l| parts.iter().all(|p| l.contains(p)));
+            .any(|l| parts.iter().all(|p| l.contains(p)))
+        /*
+        let ret = ...
         if self.verbose && ret {
             println!("Found a row for {:?}", &parts);
         }
         ret
+        */
     }
 
     pub fn append_log(&self, line: String) {
@@ -317,6 +321,158 @@ impl MW {
         }
         Ok(())
     }
+
+    // First variables need to be ?q and ?image
+    pub fn depicts_p18_sparql(&mut self, sparql: &str, desc: &str, skip_artwork: bool) {
+        let wikidata =
+            Api::new_from_builder("https://www.wikidata.org/w/api.php", MW::get_builder()).unwrap();
+        let json = wikidata.sparql_query(&sparql).expect("SPARQL query failed");
+
+        let candidates: Vec<(String, String)> = match json["results"]["bindings"].as_array() {
+            Some(b) => b,
+            None => panic!("No bindings in SPARQL results"),
+        }
+        .iter()
+        .filter_map(
+            |b| match (b["q"]["value"].as_str(), b["image"]["value"].as_str()) {
+                (Some(q), Some(i)) => Some((
+                    wikidata.extract_entity_from_uri(q).ok()?,
+                    MW::percent_decode_title(i.split('/').last()?.to_string()),
+                )),
+                _ => return None,
+            },
+        )
+        .filter(|(q, image)| !self.in_bot_log(vec![&q, &image]))
+        .collect();
+
+        candidates.iter().for_each(|(q, image)| {
+            self.append_log(format!("{}: {:?} : \"{}\"", desc, &q, &image));
+            if skip_artwork && self.is_artwork(&format!("File:{}", &image)) {
+                return;
+            }
+            match self.add_target_prominent(&q, &image, &"P180".to_string()) {
+                Ok(_) => {}
+                Err(e) => eprintln!("{} / {}: {:?}", q, image, e),
+            }
+        });
+    }
+
+    pub fn geograph(&mut self) {
+        let url = "https://petscan.wmflabs.org/?psid=13288476&format=json"; // ~30:13284323 ; all: 11830495
+        let petscan_result = self
+            .api
+            .query_raw(url, &self.api.no_params(), "GET")
+            .expect("Petscan query failed");
+        let petscan_result: Value =
+            serde_json::from_str(&petscan_result).expect("JSON parsing of PetScan result failed");
+
+        let files = match petscan_result["*"][0]["a"]["*"].as_array() {
+            Some(c) => c,
+            None => panic!("PetScan query failed"),
+        };
+        let mut files: HashMap<String, FileContainer> = files
+            .iter()
+            .filter_map(|f| {
+                let name = f["title"].as_str()?;
+                let id = f["id"].as_u64()?;
+                let fc = FileContainer {
+                    name: name.to_string(),
+                    id: id,
+                };
+                Some((fc.m_id(), fc))
+            })
+            .collect();
+
+        let m_ids = files.iter().map(|(k, _v)| k).cloned().collect();
+        let ec = EntityContainer::new();
+        ec.load_entities(&self.api, &m_ids)
+            .expect("Loading entities failed");
+
+        files
+            .iter_mut()
+            .for_each(|(_, f)| f.process(&self.api).unwrap());
+
+        println!("{:?}", files);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileContainer {
+    name: String,
+    id: u64,
+}
+
+impl FileContainer {
+    pub fn m_id(&self) -> String {
+        format!("M{}", self.id)
+    }
+
+    pub fn page_title(&self) -> String {
+        format!("File:{}", &self.name)
+    }
+
+    pub fn process(&mut self, api: &Api) -> Result<(), Box<dyn Error>> {
+        let page_title = self.page_title();
+        let params = vec![
+            ("page", page_title.as_str()),
+            ("action", "parse"),
+            ("prop", "wikitext"),
+        ];
+        let j = api.query_api_json(&api.params_into(&params), "GET")?;
+        println!("{:#?}", &j);
+        let wikitext = j["parse"]["wikitext"]["*"]
+            .as_str()
+            .ok_or(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("OH NO"),
+            ))?
+            .to_string();
+
+        //println!("{:?}", wikitext);
+
+        let tree = mediawiki_parser::parse(wikitext.as_str())?;
+        //println!("{:#?}", &tree);
+        let document = match tree {
+            Element::Document(d) => d,
+            _ => {
+                eprintln!("Not a document: {:?}", tree);
+                return Ok(());
+            }
+        };
+        document.content.iter().for_each(|e| {
+            match e {
+                Element::Heading(h) => match h.caption.get(0) {
+                    Some(Element::Template(t)) => {
+                        let template = self.get_template_name(t);
+                        match template.map(|x| x.to_owned().as_str()) {
+                            Some("int:filedesc") => println!("File desc heading"),
+                            _ => {
+                                println!("\nDon't know {:#?}", e);
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        println!("\nDon't know {:#?}", e);
+                        return;
+                    }
+                },
+                _ => {
+                    // Ignore
+                    println!("\nDon't know {:#?}", e);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn get_template_name(&self, t: &mediawiki_parser::Template) -> Option<String> {
+        match t.name.get(0) {
+            Some(Element::Text(txt)) => Some(txt.text.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -450,8 +606,9 @@ struct ItemArticleImagesPageImage {
     pub pageimage: Option<String>,
 }
 
-fn depicts_p18_and_free_page_image(sparql_part: &str, server: &str) {
+fn _depicts_p18_and_free_page_image(sparql_part: &str, server: &str) {
     let mut commons = MW::new_from_ini_file("bot.ini", "https://commons.wikimedia.org/w/api.php");
+    commons.verbose = true;
     let local_wiki_api = Api::new_from_builder(
         format!("https://{}/w/api.php", &server).as_str(),
         MW::get_builder(),
@@ -510,7 +667,25 @@ fn depicts_p18_and_free_page_image(sparql_part: &str, server: &str) {
 
 fn main() {
     //depicts_german_buildings();
-    depicts_p18_and_free_page_image("?q wdt:P31 wd:Q5 ; wdt:P21 wd:Q6581072", "de.wikipedia.org");
+    //depicts_p18_and_free_page_image("?q wdt:P31 wd:Q5 ; wdt:P21 wd:Q6581072", "de.wikipedia.org");
+
+    let mut commons = MW::new_from_ini_file("bot.ini", "https://commons.wikimedia.org/w/api.php");
+    commons.verbose = true;
+    commons.geograph();
+    /*
+    commons.depicts_p18_sparql(
+        "SELECT ?q ?image { ?q wdt:P31 wd:Q16521 ; wdt:P105 wd:Q7432 ; wdt:P18 ?image } LIMIT 500",
+        "species",
+        false,
+    );
+    */
+    /*
+    commons.depicts_p18_sparql(
+        "SELECT ?q ?image { ?q wdt:P1435 wd:Q17297633 ; wdt:P18 ?image }",
+        "Bavarian monuments",
+        true,
+    );
+    */
 }
 
 #[cfg(test)]

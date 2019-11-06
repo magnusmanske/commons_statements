@@ -11,7 +11,7 @@ edition = "2018"
 
 #wikibase = "0.3.7"
 #wikibase = { path = "../wikibase_rs" }
-wikibase = { git="https://gitlab.com/tobias47n9e/wikibase_rs",branch="rayon"}
+wikibase = { git="https://gitlab.com/tobias47n9e/wikibase_rs"}
 
 #reqwest = "0.9.11"
 serde_json = "1.0.39"
@@ -22,3 +22,4 @@ lazy_static = "1"
 regex = "1"
 percent-encoding = "1"
 reqwest = "*"
+mediawiki_parser = { git="https://github.com/serlo/mediawiki-parser"}
